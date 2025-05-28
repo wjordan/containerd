@@ -135,7 +135,7 @@ func TestGetManifestPath(t *testing.T) {
 func TestPusherErrClosedRetry(t *testing.T) {
 	ctx := context.Background()
 
-	p, reg, _, done := samplePusher(t)
+	_, p, reg, _, done := samplePusher(t)
 	defer done()
 
 	layerContent := []byte("test")
@@ -152,7 +152,7 @@ func TestPusherErrClosedRetry(t *testing.T) {
 }
 func TestPusherCustomNamespace(t *testing.T) {
 	ctx := context.Background()
-	p, reg, _, done := samplePusher(t)
+	_, p, reg, _, done := samplePusher(t)
 	defer done()
 
 	reg.uploadable = true
@@ -171,7 +171,7 @@ func TestPusherCustomNamespace(t *testing.T) {
 func TestPusherAcceptsMissingDigestHeader(t *testing.T) {
 	ctx := context.Background()
 
-	p, reg, _, done := samplePusher(t)
+	_, p, reg, _, done := samplePusher(t)
 	defer done()
 	reg.omitDigestHdr = true
 	reg.uploadable = true
@@ -185,7 +185,7 @@ func TestPusherAcceptsMissingDigestHeader(t *testing.T) {
 func TestPusherHTTPFallback(t *testing.T) {
 	ctx := logtest.WithT(context.Background(), t)
 
-	p, reg, _, done := samplePusher(t)
+	_, p, reg, _, done := samplePusher(t)
 	defer done()
 
 	reg.uploadable = true
@@ -221,7 +221,7 @@ func TestPusherHTTPFallback(t *testing.T) {
 // TestPusherErrReset tests the push method if the request needs to be retried
 // i.e when ErrReset occurs
 func TestPusherErrReset(t *testing.T) {
-	p, reg, _, done := samplePusher(t)
+	_, p, reg, _, done := samplePusher(t)
 	defer done()
 
 	p.object = "latest@sha256:55d31f3af94c797b65b310569803cacc1c9f4a34bf61afcdc8138f89345c8308"
@@ -342,7 +342,7 @@ func TestPusherInvalidAuthorizationOnMount(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			//t.Parallel()
 
-			p, reg, _, done := samplePusher(t)
+			_, p, reg, _, done := samplePusher(t)
 			defer done()
 
 			var triggered atomic.Bool
@@ -462,31 +462,36 @@ const (
 	samplePusherLocator  = samplePusherHostname + "/samplerepository:latest"
 )
 
-func samplePusher(t *testing.T) (dockerPusher, *uploadableMockRegistry, StatusTrackLocker, func()) {
-	reg := &uploadableMockRegistry{
-		availableContents: make([]string, 0),
-	}
+func samplePusher(t *testing.T) (remotes.Resolver, dockerPusher, *uploadableMockRegistry, StatusTrackLocker, func()) {
+	reg := &uploadableMockRegistry{}
 	s := httptest.NewServer(reg)
 	u, err := url.Parse(s.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tracker := NewInMemoryTracker()
-	return dockerPusher{
+	hosts := []RegistryHost{
+		{
+			Client:       s.Client(),
+			Host:         u.Host,
+			Scheme:       u.Scheme,
+			Path:         u.Path,
+			Capabilities: HostCapabilityPull | HostCapabilityPush | HostCapabilityResolve,
+		},
+	}
+	resolver := NewResolver(ResolverOptions{
+		Hosts: func(string) ([]RegistryHost, error) {
+			return hosts, nil
+		},
+		Tracker: tracker,
+	})
+	return resolver, dockerPusher{
 		dockerBase: &dockerBase{
 			refspec: reference.Spec{
 				Locator: samplePusherLocator,
 			},
 			repository: "samplerepository",
-			hosts: []RegistryHost{
-				{
-					Client:       s.Client(),
-					Host:         u.Host,
-					Scheme:       u.Scheme,
-					Path:         u.Path,
-					Capabilities: HostCapabilityPush | HostCapabilityResolve,
-				},
-			},
+			hosts:      hosts,
 		},
 		object:  "latest",
 		tracker: tracker,
@@ -498,6 +503,7 @@ var blobUploadRegexp = regexp.MustCompile(`/([a-z0-9]+)/blobs/uploads/(.*)`)
 
 // uploadableMockRegistry provides minimal registry APIs which are enough to serve requests from dockerPusher.
 type uploadableMockRegistry struct {
+	tempContents       bytes.Buffer
 	availableContents  []string
 	uploadable         bool
 	omitDigestHdr      bool
@@ -541,7 +547,8 @@ func (u *uploadableMockRegistry) defaultHandler(w http.ResponseWriter, r *http.R
 
 			dgstr := digest.Canonical.Digester()
 
-			if _, err := io.Copy(dgstr.Hash(), r.Body); err != nil {
+			n, err := io.Copy(dgstr.Hash(), r.Body)
+			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
@@ -549,34 +556,64 @@ func (u *uploadableMockRegistry) defaultHandler(w http.ResponseWriter, r *http.R
 			query := r.URL.Query()
 			if query.Has("mount") && query.Get("from") == "always-mount" {
 				if !u.omitDigestHdr {
-					w.Header().Set("Docker-Content-Digest", dgstr.Digest().String())
+					if !u.omitDigestHdr {
+						w.Header().Set("Docker-Content-Digest", dgstr.Digest().String())
+					}
 				}
 				w.WriteHeader(http.StatusCreated)
 				return
 			}
 
-			u.availableContents = append(u.availableContents, dgstr.Digest().String())
+			if n > 0 {
+				u.availableContents = append(u.availableContents, dgstr.Digest().String())
+			}
+
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
 	} else if r.Method == http.MethodPut {
 		mfstMatches := manifestRegexp.FindStringSubmatch(r.URL.Path)
 		if len(mfstMatches) != 0 || strings.HasPrefix(r.URL.Path, "/upload") {
-			dgstr := digest.Canonical.Digester()
-			if _, err := io.Copy(dgstr.Hash(), r.Body); err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
+			contentRange := r.Header.Get("Content-Range")
+			if contentRange == "" {
+				dgstr := digest.Canonical.Digester()
+				if _, err := io.Copy(dgstr.Hash(), r.Body); err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				u.availableContents = append(u.availableContents, dgstr.Digest().String())
+				if !u.omitDigestHdr {
+					w.Header().Set("Docker-Content-Digest", dgstr.Digest().String())
+				}
+				w.WriteHeader(http.StatusCreated)
+			} else {
+				if _, err := io.Copy(&u.tempContents, r.Body); err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				dgstr := digest.Canonical.Digester()
+				if _, err := io.Copy(dgstr.Hash(), &u.tempContents); err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				u.availableContents = append(u.availableContents, dgstr.Digest().String())
+				w.WriteHeader(http.StatusCreated)
 			}
-			u.availableContents = append(u.availableContents, dgstr.Digest().String())
-			if !u.omitDigestHdr {
-				w.Header().Set("Docker-Content-Digest", dgstr.Digest().String())
-			}
-			w.WriteHeader(http.StatusCreated)
 			return
 		} else if r.URL.Path == "/cannotupload" {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+	} else if r.Method == http.MethodPatch {
+		if _, err := io.Copy(&u.tempContents, r.Body); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		rangeHeader := r.Header.Get("Content-Range")
+		w.Header().Set("Range", rangeHeader)
+		w.Header().Set("Location", u.locationPrefix+"/upload")
+		w.WriteHeader(http.StatusAccepted)
+		return
 	} else if r.Method == http.MethodHead {
 		var content string
 		// check for both manifest and blob paths
@@ -603,9 +640,15 @@ func (u *uploadableMockRegistry) isContentAlreadyExist(c string) bool {
 	return slices.Contains(u.availableContents, c)
 }
 
+type byteRangeReader []byte
+
+func (r byteRangeReader) Reader(offset, size int64) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(r[offset : offset+size])), nil
+}
+
 func Test_dockerPusher_push(t *testing.T) {
 
-	p, reg, tracker, done := samplePusher(t)
+	_, p, reg, tracker, done := samplePusher(t)
 	defer done()
 
 	reg.uploadable = true
@@ -624,6 +667,7 @@ func Test_dockerPusher_push(t *testing.T) {
 		ref               string
 		unavailableOnFail bool
 		annotations       map[string]string
+		chunkSize         int64
 	}
 	tests := []struct {
 		name             string
@@ -730,15 +774,42 @@ func Test_dockerPusher_push(t *testing.T) {
 			},
 		},
 		{
-			name: "trying to push a blob layer",
+			name: "trying to push a blob layer in monolithic",
 			dp:   p,
 			// Not needed to set the base object as it is used to generate path only in case of manifests
 			// dockerBaseObject:
 			args: args{
-				content:           layerContent,
+				content:           append(layerContent, []byte("-in-monolithic")...),
 				mediatype:         ocispec.MediaTypeImageLayer,
-				ref:               fmt.Sprintf("layer-%s", layerContentDigest.String()),
+				ref:               fmt.Sprintf("layer-%s", digest.FromBytes(append(layerContent, []byte("-in-monolithic")...)).String()),
 				unavailableOnFail: false,
+			},
+			checkerFunc: func(writer *pushWriter) bool {
+				select {
+				case resp := <-writer.respC:
+					// 201 should be the response code when uploading a new blob
+					return resp.StatusCode == http.StatusCreated
+				case <-writer.errC:
+					return false
+				}
+			},
+			wantErr: nil,
+			wantStatus: &PushStatus{
+				MountedFrom: "",
+				Exists:      false,
+			},
+		},
+		{
+			name: "trying to push a blob layer in chunked",
+			dp:   p,
+			// Not needed to set the base object as it is used to generate path only in case of manifests
+			// dockerBaseObject:
+			args: args{
+				content:           append(layerContent, []byte("-in-chunked")...),
+				mediatype:         ocispec.MediaTypeImageLayer,
+				ref:               fmt.Sprintf("layer-%s", digest.FromBytes(append(layerContent, []byte("-in-chunked")...)).String()),
+				unavailableOnFail: false,
+				chunkSize:         5,
 			},
 			checkerFunc: func(writer *pushWriter) bool {
 				select {
@@ -766,6 +837,12 @@ func Test_dockerPusher_push(t *testing.T) {
 			}
 
 			test.dp.object = test.dockerBaseObject
+			test.dp.dockerBase.hosts[0].ChunkSize = test.args.chunkSize
+			if test.args.chunkSize > 0 {
+				require.NoError(t, test.dp.PushInChunked(context.Background(), desc, byteRangeReader(test.args.content)))
+				assert.True(t, reg.isContentAlreadyExist(desc.Digest.String()))
+				return
+			}
 
 			got, err := test.dp.push(context.Background(), desc, test.args.ref, test.args.unavailableOnFail)
 
@@ -793,6 +870,8 @@ func Test_dockerPusher_push(t *testing.T) {
 			// test whether a proper response has been received after the push operation
 			assert.True(t, test.checkerFunc(pw))
 
+			assert.True(t, reg.isContentAlreadyExist(desc.Digest.String()))
+
 		})
 	}
 }
@@ -802,7 +881,7 @@ func TestPusherForbiddenGETFallbackForErrorBody(t *testing.T) {
 	// a follow-up GET to retrieve the registry's error body for diagnostics.
 	const errorMessage = "encryption key is disabled"
 
-	p, reg, _, done := samplePusher(t)
+	_, p, reg, _, done := samplePusher(t)
 	defer done()
 
 	reg.defaultHandlerFunc = func(w http.ResponseWriter, r *http.Request) bool {
@@ -840,7 +919,7 @@ func TestPusherForbiddenGETFallbackProxy(t *testing.T) {
 
 	var gotNsParam string
 
-	p, reg, _, done := samplePusher(t)
+	_, p, reg, _, done := samplePusher(t)
 	defer done()
 
 	reg.defaultHandlerFunc = func(w http.ResponseWriter, r *http.Request) bool {
